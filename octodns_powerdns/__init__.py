@@ -56,7 +56,8 @@ def _escape_unescaped_semicolons(value):
 
 class PowerDnsBaseProvider(BaseProvider):
     SUPPORTS_GEO = False
-    SUPPORTS_DYNAMIC = False
+    SUPPORTS_DYNAMIC = True
+    SUPPORTS_POOL_VALUE_STATUS = True
     SUPPORTS_ROOT_NS = True
     SUPPORTS_MULTIVALUE_PTR = True
     SUPPORTS = set(
@@ -111,10 +112,11 @@ class PowerDnsBaseProvider(BaseProvider):
         mode_of_operation='master',
         notify=False,
         server_id='localhost',
+        max_script_length=1000,
         *args,
         **kwargs,
     ):
-        super().__init__(id, *args, **kwargs)
+        super().__init__(id, strict_supports=False, *args, **kwargs)
 
         if getattr(self, '_get_nameserver_record', False):
             raise ProviderException(
@@ -130,6 +132,7 @@ class PowerDnsBaseProvider(BaseProvider):
         self.timeout = timeout
         self.notify = notify
         self.server_id = server_id
+        self.max_script_length = max_script_length
 
         self._powerdns_version = None
 
@@ -680,6 +683,80 @@ class PowerDnsBaseProvider(BaseProvider):
             return http_error.response.json()['error']
         except Exception:
             return ''
+
+    def _process_desired_zone(self, desired):
+        desired = super()._process_desired_zone(desired)
+
+        def convert_to_string(val):
+            if isinstance(val, str):
+                return f"'{val}'"
+            elif len(val) == 1:
+                return f"'{val[0]}'"
+            else:
+                return "{" + ', '.join(f"'{v}'" for v in val) + "}"
+
+        def get_script(vals, pool, rules):
+            rule = rules[pool]
+            continents = []
+            countries = []
+            lua_rule = ""
+            if "geos" in rule and len(rule['geos']) > 0:
+                for region in rule['geos']:
+                    if "-" in region:
+                        countries.append(region.split('-')[1])
+                    else:
+                        continents.append(region)
+                lua_rule = f"country({convert_to_string(countries)})"
+            else:
+                for _, rule in rules.items():
+                    if "geos" in rule:
+                        for region in rule['geos']:
+                            if "-" in region:
+                                countries.append(region.split('-')[1])
+                            else:
+                                continents.append(region)
+                lua_rule = f"not continent({convert_to_string(continents)})"
+                lua_rule = ' and '.join([f"not country({convert_to_string(country)})" for country in countries])
+
+            return f";if {lua_rule} then return {convert_to_string(vals)} end"
+
+        for rec in desired.records:
+            if getattr(rec, 'dynamic', False):
+                rules = {}
+                 #[{'pool': 'apac', 'geos': ['AF-ZA', 'AS', 'OC']}, {'pool': 'eu', 'geos': ['AF', 'EU']}, {'pool': 'na'}]
+                for rule in rec.dynamic.rules:
+                    rule = rule.data
+                    pool = rule['pool']
+                    if pool not in rules:
+                        rules[pool] = {
+                            "geos": []
+                        }
+                    if "geos" in rule:
+                        for region in rule['geos']:
+                            if len(region.split('-')) > 2:
+                                raise Exception("regions are not supported")
+                        rules[pool]["geos"].extend(rule['geos'])
+
+                rec_values = []
+                for pool, pool_data in rec.dynamic.pools.items():
+                    pool_values = pool_data.data['values']
+                    if len([v for v in pool_values if v['weight'] != 1]) > 0:
+                        raise Exception("weights are not supported")
+                    rule = rules[pool]
+                    if pool_data.data['fallback'] is None:
+                        continue
+                    script = get_script([val['value'] for val in pool_values], pool, rules)
+                    if len(script) > self.max_script_length:
+                        raise Exception(f"script is too long: {script}")
+                    rec_values.extend([{'type': rec._type, 'script': script}])
+
+                rec_data = rec.data
+                rec_data['values'] = rec_values
+
+                desired.add_record(PowerDnsLuaRecord(rec.zone, rec.name, rec_data))
+                desired.remove_record(rec)
+
+        return desired
 
     def _apply(self, plan):
         desired = plan.desired
