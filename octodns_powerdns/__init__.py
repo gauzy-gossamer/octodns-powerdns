@@ -133,6 +133,7 @@ class PowerDnsBaseProvider(BaseProvider):
         self.notify = notify
         self.server_id = server_id
         self.max_script_length = max_script_length
+        self.lua_script = """function geo_ip(geo,ips) for i=1,#geo do local c,r,g=string.match(geo[i],'([^-]*)-?([^-]*)-?([^-]*)');if((c=='' or continent(c))and(r=='' or country(r))and(g=='' or region(g)))then return ips[i]end end end"""
 
         self._powerdns_version = None
 
@@ -688,6 +689,7 @@ class PowerDnsBaseProvider(BaseProvider):
         desired = super()._process_desired_zone(desired)
 
         def convert_to_string(val):
+            """ convert arr/string to lua representation """
             if isinstance(val, str):
                 return f"'{val}'"
             elif len(val) == 1:
@@ -695,35 +697,36 @@ class PowerDnsBaseProvider(BaseProvider):
             else:
                 return "{" + ', '.join(f"'{v}'" for v in val) + "}"
 
-        def get_script(vals, pool, rules):
-            rule = rules[pool]
-            continents = []
-            countries = []
-            lua_rule = ""
-            if "geos" in rule and len(rule['geos']) > 0:
-                for region in rule['geos']:
-                    if "-" in region:
-                        countries.append(region.split('-')[1])
-                    else:
-                        continents.append(region)
-                lua_rule = f"country({convert_to_string(countries)})"
-            else:
-                for _, rule in rules.items():
-                    if "geos" in rule:
-                        for region in rule['geos']:
-                            if "-" in region:
-                                countries.append(region.split('-')[1])
-                            else:
-                                continents.append(region)
-                lua_rule = f"not continent({convert_to_string(continents)})"
-                lua_rule = ' and '.join([f"not country({convert_to_string(country)})" for country in countries])
+        def region_match(regions):
+            matches = []
+            for region in regions:
+                parts = region.split("-")
+                if len(parts) == 3:
+                    matches.append("region('{}')".format(region.split("-")[2]))
+                elif len(parts) == 2:
+                    matches.append("country('{}')".format(region.split("-")[1]))
+                elif len(parts) == 1:
+                    matches.append("continent('{}')".format(region))
+                else:
+                    raise Exception(f"incorrect region {region}")
+            return " or ".join(matches)
 
-            return f";if {lua_rule} then return {convert_to_string(vals)} end"
+        def get_script(geos, ips):
+            """ if there are only 2 rules, return if-else statement; if more than 2 - include lua_script and call it"""
+            if len(geos) < 3:
+                match_region = region_match(geos[0])
+
+                else_stmt = ""
+                if len(geos) > 1:
+                    else_stmt = f"else {convert_to_string(ips[1])}"
+
+                return f"; if {match_region} then return {convert_to_string(ips[0])} {else_stmt} end", False
+
+            return f";include('_lua-script'); return geo_ip({{{','.join([convert_to_string(geo) for geo in geos])}}}, {{{','.join([convert_to_string(ip) for ip in ips])}}})", True
 
         for rec in desired.records:
             if getattr(rec, 'dynamic', False):
                 rules = {}
-                 #[{'pool': 'apac', 'geos': ['AF-ZA', 'AS', 'OC']}, {'pool': 'eu', 'geos': ['AF', 'EU']}, {'pool': 'na'}]
                 for rule in rec.dynamic.rules:
                     rule = rule.data
                     pool = rule['pool']
@@ -732,29 +735,40 @@ class PowerDnsBaseProvider(BaseProvider):
                             "geos": []
                         }
                     if "geos" in rule:
-                        for region in rule['geos']:
-                            if len(region.split('-')) > 2:
-                                raise Exception("regions are not supported")
                         rules[pool]["geos"].extend(rule['geos'])
 
-                rec_values = []
+                fallback = []
+                geos = []
+                ips = []
                 for pool, pool_data in rec.dynamic.pools.items():
                     pool_values = pool_data.data['values']
                     if len([v for v in pool_values if v['weight'] != 1]) > 0:
                         raise Exception("weights are not supported")
                     rule = rules[pool]
                     if pool_data.data['fallback'] is None:
+                        fallback = [val['value'] for val in pool_values]
                         continue
-                    script = get_script([val['value'] for val in pool_values], pool, rules)
-                    if len(script) > self.max_script_length:
-                        raise Exception(f"script is too long: {script}")
-                    rec_values.extend([{'type': rec._type, 'script': script}])
+                    ips.append([val['value'] for val in pool_values])
+                    geos_ = rules.get(pool, {}).get('geos', [])
+                    geos.append(geos_)
+
+                if len(fallback) > 0:
+                    ips.append(fallback)
+                    geos.append('')
+
+                script, lua_required = get_script(geos, ips)
+                if len(script) > self.max_script_length:
+                    raise Exception(f"script is too long: {script}")
 
                 rec_data = rec.data
-                rec_data['values'] = rec_values
+                rec_data['values'] = [{'type': rec._type, 'script': script}]
 
                 desired.add_record(PowerDnsLuaRecord(rec.zone, rec.name, rec_data))
                 desired.remove_record(rec)
+
+                if lua_required:
+                    rec_data = {'ttl': 60, 'values': [{'type': 'LUA', 'script': self.lua_script}]}
+                    desired.add_record(PowerDnsLuaRecord(rec.zone, "_lua-script", rec_data))
 
         return desired
 
