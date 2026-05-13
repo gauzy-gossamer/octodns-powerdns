@@ -56,7 +56,7 @@ def _escape_unescaped_semicolons(value):
 
 class PowerDnsBaseProvider(BaseProvider):
     SUPPORTS_GEO = False
-    SUPPORTS_DYNAMIC = True
+    SUPPORTS_DYNAMIC = False
     SUPPORTS_POOL_VALUE_STATUS = True
     SUPPORTS_ROOT_NS = True
     SUPPORTS_MULTIVALUE_PTR = True
@@ -113,10 +113,13 @@ class PowerDnsBaseProvider(BaseProvider):
         notify=False,
         server_id='localhost',
         max_script_length=1000,
+        support_lua_records=False,
         *args,
         **kwargs,
     ):
-        super().__init__(id, strict_supports=False, *args, **kwargs)
+        PowerDnsBaseProvider.SUPPORTS_DYNAMIC = support_lua_records
+        strict_supports = not support_lua_records
+        super().__init__(id, strict_supports=strict_supports, *args, **kwargs)
 
         if getattr(self, '_get_nameserver_record', False):
             raise ProviderException(
@@ -132,8 +135,10 @@ class PowerDnsBaseProvider(BaseProvider):
         self.timeout = timeout
         self.notify = notify
         self.server_id = server_id
+
+        self.support_lua_records = support_lua_records
         self.max_script_length = max_script_length
-        self.lua_script = """function geo_ip(geo,ips) for i=1,#geo do local c,r,g=string.match(geo[i],'([^-]*)-?([^-]*)-?([^-]*)');if((c=='' or continent(c))and(r=='' or country(r))and(g=='' or region(g)))then return ips[i]end end end"""
+        self.lua_script = """function geo_ip(geo,ips) for i=1,#geo do local ge=geo[i];local pt = type(ge) == 'string' and {ge} or ge;for j=1,#pt do local c,r,g,ct=string.match(pt[j],'([^-]*)-?([^-]*)-?([^-]*)-?([^-]*)');if((c=='' or continent(c))and(r=='' or country(r))and(g=='' or region(g))and(ct=='' or geoiplookup(bestwho:toString(),1)==ct))then return ips[i]end end end end"""
 
         self._powerdns_version = None
 
@@ -685,9 +690,7 @@ class PowerDnsBaseProvider(BaseProvider):
         except Exception:
             return ''
 
-    def _process_desired_zone(self, desired):
-        desired = super()._process_desired_zone(desired)
-
+    def _create_lua_records(self, desired):
         def convert_to_string(val):
             """ convert arr/string to lua representation """
             if isinstance(val, str):
@@ -702,11 +705,13 @@ class PowerDnsBaseProvider(BaseProvider):
             for region in regions:
                 parts = region.split("-")
                 if len(parts) == 3:
-                    matches.append("region('{}')".format(region.split("-")[2]))
+                    matches.append("(country('{}') and region('{}'))".format(parts[1], parts[2]))
                 elif len(parts) == 2:
-                    matches.append("country('{}')".format(region.split("-")[1]))
+                    matches.append("country('{}')".format(parts[1]))
                 elif len(parts) == 1:
                     matches.append("continent('{}')".format(region))
+                elif len(parts) == 4:
+                    matches.append("(geoiplookup(bestwho:toString(),1)=='{}' and region('{}'))".format(parts[3], parts[2]))
                 else:
                     raise Exception(f"incorrect region {region}")
             return " or ".join(matches)
@@ -718,11 +723,13 @@ class PowerDnsBaseProvider(BaseProvider):
 
                 else_stmt = ""
                 if len(geos) > 1:
-                    else_stmt = f"else {convert_to_string(ips[1])}"
+                    else_stmt = f"else return {convert_to_string(ips[1])}"
 
                 return f"; if {match_region} then return {convert_to_string(ips[0])} {else_stmt} end", False
 
             return f";include('_lua-script'); return geo_ip({{{','.join([convert_to_string(geo) for geo in geos])}}}, {{{','.join([convert_to_string(ip) for ip in ips])}}})", True
+
+        added_lua_scripts = set() # prevent double lua script records
 
         for rec in desired.records:
             if getattr(rec, 'dynamic', False):
@@ -737,7 +744,7 @@ class PowerDnsBaseProvider(BaseProvider):
                     if "geos" in rule:
                         rules[pool]["geos"].extend(rule['geos'])
 
-                fallback = []
+                fallback = rec.data['values']
                 geos = []
                 ips = []
                 for pool, pool_data in rec.dynamic.pools.items():
@@ -766,9 +773,17 @@ class PowerDnsBaseProvider(BaseProvider):
                 desired.add_record(PowerDnsLuaRecord(rec.zone, rec.name, rec_data))
                 desired.remove_record(rec)
 
-                if lua_required:
+                if lua_required and rec.zone not in added_lua_scripts:
                     rec_data = {'ttl': 60, 'values': [{'type': 'LUA', 'script': self.lua_script}]}
                     desired.add_record(PowerDnsLuaRecord(rec.zone, "_lua-script", rec_data))
+                    added_lua_scripts.add(rec.zone)
+
+        return desired
+
+    def _process_desired_zone(self, desired):
+        desired = super()._process_desired_zone(desired)
+        if self.support_lua_records:
+            return self._create_lua_records(desired)
 
         return desired
 
