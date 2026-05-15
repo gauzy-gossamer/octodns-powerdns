@@ -745,7 +745,7 @@ class PowerDnsBaseProvider(BaseProvider):
                     if "geos" in rule:
                         rules[pool]["geos"].extend(rule['geos'])
 
-                fallback = rec.data['values']
+                fallback = rec.data.get('values', [])
                 geos = []
                 ips = []
                 for pool, pool_data in rec.dynamic.pools.items():
