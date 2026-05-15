@@ -118,8 +118,9 @@ class PowerDnsBaseProvider(BaseProvider):
         **kwargs,
     ):
         PowerDnsBaseProvider.SUPPORTS_DYNAMIC = support_lua_records
-        strict_supports = not support_lua_records
-        super().__init__(id, strict_supports=strict_supports, *args, **kwargs)
+        if not kwargs.get('strict_supports', True) or support_lua_records:
+            kwargs['strict_supports'] = False
+        super().__init__(id, *args, **kwargs)
 
         if getattr(self, '_get_nameserver_record', False):
             raise ProviderException(
